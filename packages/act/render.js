@@ -1,150 +1,304 @@
-const TEXT_ELEMENT = "TEXT ELEMENT"; // 类型
+// Fiber tags
+import {createDomElement, updateDomProperties} from "act-dom/utils";
 
-let rootInstance = null;
+const HOST_COMPONENT = "host";
+const CLASS_COMPONENT = "class";
+const HOST_ROOT = "root";
 
-export default function render(element, container) {
+// Global state
+const updateQueue = [];
+let nextUnitOfWork = null;
+let pendingCommit = null;
 
-    const prevInstance = rootInstance; // 1-虚拟dom主树干- == null
-    const nextInstance = reconcile(container, prevInstance, element);
-    rootInstance = nextInstance; // 2-支树干- 领头啦
+export default function render(elements, containerDom) {
+    updateQueue.push({ // 用作一个队列, 先进先出
+        from: HOST_ROOT,
+        dom: containerDom,
+        newProps: { children: elements }
+    });
+    requestIdleCallback(performWork); // 下一个浏览器空闲时
 }
 
-function createPublicInstance(element, internalInstance) {
-    // 当 元素进到这里来, 说明
-    // type 是 一个函数
-    const { type, props } = element;
-    // 新建-实例
-    const publicInstance = new type(props);
-    //
-    publicInstance.__internalInstance = internalInstance; //
-    return publicInstance;
+export function scheduleUpdate(instance, partialState) { // 提供给 setState 使用
+    updateQueue.push({
+        from: CLASS_COMPONENT,
+        instance: instance,
+        partialState: partialState
+    });
+    requestIdleCallback(performWork);
 }
 
-// 对比-元素 并 更新 html
-export function reconcile(parentDom, instance, element) {
+const ENOUGH_TIME = 1; // milliseconds
+
+// 执行工作
+function performWork(deadline) {
+    workLoop(deadline);
+    if (nextUnitOfWork || updateQueue.length > 0) {
+        requestIdleCallback(performWork);
+    }
+}
+
+// 工作循环，
+function workLoop(deadline) {
+    // 下一个工作不是空，进入重置工作单元
+    if (!nextUnitOfWork) {
+        resetNextUnitOfWork();
+    }
+    while (nextUnitOfWork && deadline.timeRemaining() > ENOUGH_TIME) {
+        // 关注时间 是否足够 运行另一个工作单元
+        nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
+    }
+    if (pendingCommit) {
+        commitAllWork(pendingCommit);
+    }
+}
+
+function resetNextUnitOfWork() {
+    // 取出第一个 update，如果没有 update 了则结束重置工作
+    const update = updateQueue.shift();
+    if (!update) {
+        return;
+    }
+
+    // 如果有 partialState ，将新状态给到 fiber
+    if (update.partialState) {
+        update.instance.__fiber.partialState = update.partialState;
+    }
+
+    const root =
+        update.from == HOST_ROOT
+            ? update.dom._rootContainerFiber
+            : getRoot(update.instance.__fiber);
+
+    nextUnitOfWork = {
+        tag: HOST_ROOT,
+        // 两种情况 这stateNode将是对Component实例的引用. 它可以是DOM元素, 也可以是用户定义的Component-class的实例.
+        stateNode: update.dom || root.stateNode,
+        props: update.newProps || root.props,
+        alternate: root
+    };
+}
+
+// 获取根节点
+function getRoot(fiber) {
+    let node = fiber;
+    while (node.parent) {
+        node = node.parent;
+    }
+    return node;
+}
+
+
+function performUnitOfWork(wipFiber) {
+    beginWork(wipFiber);
+    if (wipFiber.child) { // 深度优先
+        return wipFiber.child;
+    }
+
+    // 到达最低层，
+    let uow = wipFiber;
+    while (uow) {
+        completeWork(uow);
+        if (uow.sibling) { // 如果有兄弟节点，返回到 beginWork
+            return uow.sibling;
+        }
+        uow = uow.parent;
+    }
+}
+
+
+function beginWork(wipFiber) {
+    if (wipFiber.tag == CLASS_COMPONENT) {
+        updateClassComponent(wipFiber);
+    } else {
+        updateHostComponent(wipFiber);
+    }
+}
+
+function updateHostComponent(wipFiber) {
+    if (!wipFiber.stateNode) {
+        wipFiber.stateNode = createDomElement(wipFiber);
+    }
+    const newChildElements = wipFiber.props.children;
+    reconcileChildrenArray(wipFiber, newChildElements);
+}
+
+function createInstance(fiber) {
+    const instance = new fiber.type(fiber.props);
+    instance.__fiber = fiber;
+    return instance;
+}
+
+function updateClassComponent(wipFiber) {
+    let instance = wipFiber.stateNode;
     if (instance == null) {
-        // Create instance
-        const newInstance = instantiate(element);
-        parentDom.appendChild(newInstance.dom);
-        return newInstance;
-    } else if (element == null) {
-        // Remove instance
-        parentDom.removeChild(instance.dom);
-        return null;
-    } else if (instance.element.type !== element.type) {
-        // Replace instance
-        const newInstance = instantiate(element);
-        parentDom.replaceChild(newInstance.dom, instance.dom);
-        return newInstance;
-    } else if (typeof element.type === "string") {
-        // Update dom instance
-        updateDomProperties(instance.dom, instance.element.props, element.props);
-        instance.childInstances = reconcileChildren(instance, element);
-        instance.element = element;
-        return instance;
+        // 调用类初始化
+        instance = wipFiber.stateNode = createInstance(wipFiber);
+    } else if (wipFiber.props == instance.props && !wipFiber.partialState) {
+        // 不需要更新,最后 复制 孩子
+        cloneChildFibers(wipFiber);
+        return;
+    }
+
+    instance.props = wipFiber.props;
+    instance.state = Object.assign({}, instance.state, wipFiber.partialState);
+    wipFiber.partialState = null;
+
+    const newChildElements = wipFiber.stateNode.render();
+    reconcileChildrenArray(wipFiber, newChildElements);
+}
+
+function cloneChildFibers(parentFiber) {
+    const oldFiber = parentFiber.alternate;
+    if (!oldFiber.child) {
+        return;
+    }
+
+    let oldChild = oldFiber.child;
+    let prevChild = null;
+    while (oldChild) {
+        const newChild = {
+            type: oldChild.type,
+            tag: oldChild.tag,
+            stateNode: oldChild.stateNode,
+            props: oldChild.props,
+            partialState: oldChild.partialState,
+            alternate: oldChild,
+            parent: parentFiber
+        };
+        if (prevChild) {
+            prevChild.sibling = newChild;
+        } else {
+            parentFiber.child = newChild;
+        }
+        prevChild = newChild;
+        oldChild = oldChild.sibling;
+    }
+}
+
+// Effect tags
+const PLACEMENT = 1;
+const DELETION = 2;
+const UPDATE = 3;
+
+function arrify(val) {
+    return val == null ? [] : Array.isArray(val) ? val : [val];
+}
+
+function reconcileChildrenArray(wipFiber, newChildElements) {
+    const elements = arrify(newChildElements);
+
+    let index = 0;
+    let oldFiber = wipFiber.alternate ? wipFiber.alternate.child : null;
+    let newFiber = null;
+    while (index < elements.length || oldFiber != null) {
+        const prevFiber = newFiber;
+        const element = index < elements.length && elements[index];
+        const sameType = oldFiber && element && element.type == oldFiber.type;
+
+        if (sameType) {
+            newFiber = {
+                type: oldFiber.type,
+                tag: oldFiber.tag,
+                stateNode: oldFiber.stateNode,
+                props: element.props,
+                parent: wipFiber,
+                alternate: oldFiber,
+                partialState: oldFiber.partialState,
+                effectTag: UPDATE
+            };
+        }
+
+        if (element && !sameType) {
+            newFiber = {
+                type: element.type,
+                tag:
+                    typeof element.type === "string" ? HOST_COMPONENT : CLASS_COMPONENT,
+                props: element.props,
+                parent: wipFiber,
+                effectTag: PLACEMENT
+            };
+        }
+
+        if (oldFiber && !sameType) {
+            oldFiber.effectTag = DELETION;
+            wipFiber.effects = wipFiber.effects || [];
+            wipFiber.effects.push(oldFiber);
+        }
+
+        if (oldFiber) {
+            oldFiber = oldFiber.sibling;
+        }
+
+        if (index == 0) {
+            wipFiber.child = newFiber;
+        } else if (prevFiber && element) {
+            prevFiber.sibling = newFiber;
+        }
+
+        index++;
+    }
+}
+
+
+function completeWork(fiber) {
+    if (fiber.tag == CLASS_COMPONENT) {
+        fiber.stateNode.__fiber = fiber;
+    }
+
+    if (fiber.parent) {
+        const childEffects = fiber.effects || [];
+        const thisEffect = fiber.effectTag != null ? [fiber] : [];
+        const parentEffects = fiber.parent.effects || [];
+        fiber.parent.effects = parentEffects.concat(childEffects, thisEffect);
     } else {
-        //Update composite instance
-        // 更新-组件-
-
-        // parentDom 真实-html-树
-        // element Didact元素 新
-        // instance  旧
-
-        instance.publicInstance.props = element.props; // 更新-props
-        const childElement = instance.publicInstance.render(); // 组件的render函数
-        const oldChildInstance = instance.childInstance;
-        const childInstance = reconcile(parentDom, oldChildInstance, childElement); // 对比-剩下-孩子
-        instance.dom = childInstance.dom; // 更新-dom
-        instance.childInstance = childInstance; // 更新-虚拟dom数
-        instance.element = element; // 更新-Didact元素
-        return instance;
+        pendingCommit = fiber;
     }
 }
 
-function reconcileChildren(instance, element) {
-    const dom = instance.dom;
-    const childInstances = instance.childInstances;
-    const nextChildElements = element.props.children || [];
-    const newChildInstances = [];
-    const count = Math.max(childInstances.length, nextChildElements.length);
-    for (let i = 0; i < count; i++) {
-        const childInstance = childInstances[i];
-        const childElement = nextChildElements[i];
-        const newChildInstance = reconcile(dom, childInstance, childElement);
-        newChildInstances.push(newChildInstance);
-    }
-    return newChildInstances.filter(instance => instance != null); // <---- 2
+function commitAllWork(fiber) {
+    fiber.effects.forEach(f => {
+        commitWork(f);
+    });
+    fiber.stateNode._rootContainerFiber = fiber;
+    nextUnitOfWork = null; // Reset
+    pendingCommit = null;
 }
 
-// ------ 递归 - instantiate - 运行一次以上 -----
-function instantiate(element) {
-    const { type, props } = element;
-    const isDomElement = typeof type === "string";
-    //
+function commitWork(fiber) {
+    if (fiber.tag == HOST_ROOT) {
+        return;
+    }
 
-    if (isDomElement) {
-        // Instantiate DOM element
-        // 初始化 Didact 元素
-        const isTextElement = type === TEXT_ELEMENT;
-        const dom = isTextElement
-            ? document.createTextNode("")
-            : document.createElement(type);
+    let domParentFiber = fiber.parent;
+    while (domParentFiber.tag == CLASS_COMPONENT) {
+        domParentFiber = domParentFiber.parent;
+    }
+    const domParent = domParentFiber.stateNode;
 
-        updateDomProperties(dom, [], props);
-
-        const childElements = props.children || [];
-        const childInstances = childElements.map(instantiate);
-        const childDoms = childInstances.map(childInstance => childInstance.dom);
-        childDoms.forEach(childDom => dom.appendChild(childDom));
-
-        const instance = { dom, element, childInstances };
-        return instance;
-    } else {
-        // Instantiate component element
-        // 初始化 组件 <App />
-        const instance = {};
-
-        // createPublicInstance
-        // 1. 新建 newApp = new App()
-        // 2. newApp.__internalInstance = instance
-        // 3. publicInstance = newApp
-        const publicInstance = createPublicInstance(element, instance);
-        //
-        const childElement = publicInstance.render(); // 自己定义的 渲染-render-函数
-
-        const childInstance = instantiate(childElement); // 递归 孩子拿到 { dom, element, childInstances }
-        const dom = childInstance.dom;
-
-        Object.assign(instance, { dom, element, childInstance:childInstance, publicInstance }); // >> 组件元素比Didact元素 多了本身- 实例
-        return instance;
+    if (fiber.effectTag == PLACEMENT && fiber.tag == HOST_COMPONENT) {
+        domParent.appendChild(fiber.stateNode); // add
+    } else if (fiber.effectTag == UPDATE) {
+        updateDomProperties(fiber.stateNode, fiber.alternate.props, fiber.props);
+    } else if (fiber.effectTag == DELETION) {
+        commitDeletion(fiber, domParent);
     }
 }
 
-function updateDomProperties(dom, prevProps, nextProps) {
-    const isEvent = name => name.startsWith("on");
-    const isAttribute = name => !isEvent(name) && name != "children";
-
-// preProps Remove
-    // Remove event listeners
-    Object.keys(prevProps).filter(isEvent).forEach(name => {
-        const eventType = name.toLowerCase().substring(2);
-        dom.removeEventListener(eventType, prevProps[name]);
-    });
-
-    // Remove attributes
-    Object.keys(prevProps).filter(isAttribute).forEach(name => {
-        dom[name] = null;
-    });
-
-// nextProps Add
-    // Set attributes
-    Object.keys(nextProps).filter(isAttribute).forEach(name => {
-        dom[name] = nextProps[name];
-    });
-
-    // Add event listeners
-    Object.keys(nextProps).filter(isEvent).forEach(name => {
-        const eventType = name.toLowerCase().substring(2);
-        dom.addEventListener(eventType, nextProps[name]);
-    });
+function commitDeletion(fiber, domParent) {
+    let node = fiber;
+    while (true) {
+        if (node.tag == CLASS_COMPONENT) {
+            node = node.child;
+            continue;
+        }
+        domParent.removeChild(node.stateNode);
+        while (node != fiber && !node.sibling) {
+            node = node.parent;
+        }
+        if (node == fiber) {
+            return;
+        }
+        node = node.sibling;
+    }
 }
